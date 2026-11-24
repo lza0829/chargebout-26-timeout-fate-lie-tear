@@ -1,7 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
 
-const surface_panel = true
 export default function Timeout() {
   const [cands, setCands] = useState([])
   const [receipts, setReceipts] = useState([])
@@ -51,7 +50,7 @@ export default function Timeout() {
   }
 
   return (
-    <div className={surface_panel ? "page" : "page"}>
+    <div className="page">
       <h2>超时强制关账</h2>
       <p className="lead">
         口径：超时即按锁定电价强制关账并加收、释放占用；超时后禁止再记脉冲、不可重复关账。

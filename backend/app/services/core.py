@@ -1,6 +1,5 @@
 from __future__ import annotations
 from datetime import datetime
-from app.services import timeout_surface
 
 from app.db import db, row_dict, rows
 
@@ -219,10 +218,4 @@ def session_detail(conn, session_id: int):
     d["结算可点"] = se["status"] in ("充电中", "结算中")
     d["占用中"] = se["status"] in ("充电中", "结算中")
     return d
-
-_overview_impl = overview
-
-
-def overview(conn):
-    return timeout_surface.overlay_overview(_overview_impl(conn), conn)
 

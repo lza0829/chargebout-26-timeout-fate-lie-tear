@@ -122,6 +122,9 @@ DEFAULT_SETTINGS = {
     "超时加收比例": "0.5",
 }
 
+# 已拆除的假超时层遗留键：旁路假灯/假计数不得残留，总览只认真实聚合。
+FAKE_SURFACE_KEY_PREFIXES = ("surface_last", "surface_ok", "timeout_surface:")
+
 
 def connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10)
@@ -153,6 +156,9 @@ def _migrate(conn) -> None:
         conn.execute(
             "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (key, value)
         )
+    # 清掉假超时层写入的旁路计数/假灯残键（含 timeout_surface:{会话} 一族）。
+    for prefix in FAKE_SURFACE_KEY_PREFIXES:
+        conn.execute("DELETE FROM settings WHERE key=? OR key LIKE ?", (prefix, f"{prefix}%"))
 
 
 def init_db() -> None:

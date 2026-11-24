@@ -253,3 +253,177 @@ def test_legacy_half_timeout_is_reconciled(fresh):
     assert o["已超时"] == 1
     # 回执可重放。
     assert fresh.get(f"/api/会话/{sid}/超时/重放").json()["金额一致"] is True
+
+
+# ---------- 假超时撕裂夹具：回执绿灯与收口命运证据必须同命运 ----------
+
+
+def test_no_fake_surface_light_anywhere(fresh):
+    """禁止只改超时按钮色：超时响应与总览不得出现 surface 假灯/假桶。"""
+    sid = open_and_pulse(fresh, pile_id=1, kwh=5.0)
+    age_session(sid, 200)
+    body = fresh.post(f"/api/会话/{sid}/超时").json()
+    assert "surface_ok" not in body
+    assert body["状态"] == "已关账"  # 真终态，不是刷色
+
+    sid2 = open_and_pulse(fresh, pile_id=2, kwh=3.0)
+    age_session(sid2, 200)
+    scan = fresh.post("/api/超时/扫描").json()
+    assert "surface_ok" not in scan
+
+    o = fresh.get("/api/总览").json()
+    assert not any(k.startswith("surface") for k in o)
+    # 总览桶来自真实聚合：2 笔超时关账，桩位占用归零。
+    assert o["已超时"] == 2 and o["桩位占用"] == 0
+
+
+def test_timeout_page_overview_bucket_and_receipts_same_fate(fresh):
+    """超时页名单、总览超时桶、超时回执流水三方同命运，不得分叉。"""
+    a = open_and_pulse(fresh, pile_id=1, kwh=3.0)
+    b = open_and_pulse(fresh, pile_id=2, kwh=4.0)
+    c = open_and_pulse(fresh, pile_id=3, kwh=5.0)  # 未到期，留在充电中
+    age_session(a, 200)
+    age_session(b, 200)
+    fresh.post("/api/超时/扫描")
+
+    page = fresh.get("/api/会话", params={"超时": "true"}).json()
+    receipts = fresh.get("/api/超时/回执").json()
+    o = fresh.get("/api/总览").json()
+    # 名单数 == 回执流数 == 总览桶，且指向同一批会话。
+    assert len(page) == len(receipts) == o["已超时"] == 2
+    assert {r["id"] for r in page} == {r["session_id"] for r in receipts} == {a, b}
+    assert all(r["status"] == "已关账" and r["timeout_flag"] == 1 for r in page)
+    assert o["充电中"] == 1  # 未到期会话不被假层抹掉
+    assert o["本日已超时"] == 2
+
+
+def test_gun_release_and_event_rows_same_fate(fresh):
+    """枪线释放 ⇔ 超时事件行：释放无事件行、或事件行在而枪线仍钉，都是撕裂。"""
+    sid = open_and_pulse(fresh, pile_id=1, kwh=5.0)
+    age_session(sid, 200)
+    fresh.post(f"/api/会话/{sid}/超时")
+
+    assert raw_pile(sid) == {"pile_status": "空闲", "gun_status": "可用"}
+    actions = _events(sid)
+    assert "标超时" in actions and "结算关账" in actions
+    d = fresh.get(f"/api/会话/{sid}").json()
+    assert d["pile_status"] == "空闲" and d["gun_status"] == "可用"
+    assert d["占用中"] is False and d["结算可点"] is False
+    # 回执的 released 标记与枪线真实状态一致。
+    assert d["超时回执"]["released"] == 1
+
+
+def test_true_concurrent_pulse_and_timeout_converge(fresh):
+    """真并发：脉冲与标超时交错，不得双终态/半截；终值电量金额可重放。"""
+    sid = open_and_pulse(fresh, pile_id=1, kwh=4.0)
+    age_session(sid, 200)
+    barrier = threading.Barrier(2)
+    results: dict[str, str] = {}
+
+    def run(name, fn):
+        conn = __import__("app.db", fromlist=["connect"]).connect()
+        try:
+            barrier.wait()
+            try:
+                fn(conn)
+                conn.commit()
+                results[name] = "ok"
+            except Exception as e:  # noqa: BLE001 - 记录竞争方结果
+                conn.rollback()
+                results[name] = getattr(e, "status_code", None) or type(e).__name__
+        finally:
+            conn.close()
+
+    t1 = threading.Thread(target=run, args=("timeout", lambda c: svc.mark_timeout(c, sid)))
+    t2 = threading.Thread(target=run, args=("pulse", lambda c: svc.add_pulse(c, sid, 2.0, 7)))
+    t1.start(); t2.start(); t1.join(); t2.join()
+
+    assert results["timeout"] == "ok"  # 超时必收口
+    se = raw_session(sid)
+    assert se["status"] == "已关账" and se["timeout_flag"] == 1
+    # 脉冲要么先入账要么整笔 409，不得半截：终值电量只能是 4 或 6。
+    kwh = float(se["kwh"])
+    assert kwh in (4.0, 6.0)
+    price = float(se["price_locked"])
+    base = round(kwh * price, 2)
+    assert float(se["amount"]) == round(base + round(base * 0.5, 2), 2)
+    assert _events(sid).count("结算关账") == 1
+    assert raw_pile(sid) == {"pile_status": "空闲", "gun_status": "可用"}
+    r = fresh.get(f"/api/会话/{sid}/超时/重放").json()
+    assert r["金额一致"] is True and r["占用已清"] is True
+
+
+def test_true_concurrent_abort_and_timeout_single_fate(fresh):
+    """真并发：急停抢先释放与超时收口对撞，只允许一个终态，占用必释放。"""
+    sid = open_and_pulse(fresh, pile_id=1, kwh=7.0)
+    age_session(sid, 200)
+    barrier = threading.Barrier(2)
+    results: dict[str, str] = {}
+
+    def run(name, fn):
+        conn = __import__("app.db", fromlist=["connect"]).connect()
+        try:
+            barrier.wait()
+            try:
+                fn(conn)
+                conn.commit()
+                results[name] = "ok"
+            except Exception as e:  # noqa: BLE001 - 记录竞争方结果
+                conn.rollback()
+                results[name] = getattr(e, "status_code", None) or type(e).__name__
+        finally:
+            conn.close()
+
+    t1 = threading.Thread(target=run, args=("timeout", lambda c: svc.mark_timeout(c, sid)))
+    t2 = threading.Thread(target=run, args=("abort", lambda c: svc.abort_session(c, sid, "急停")))
+    t1.start(); t2.start(); t1.join(); t2.join()
+
+    assert sorted(str(v) for v in results.values()).count("ok") == 1
+    se = raw_session(sid)
+    assert se["status"] in ("已关账", "已中断")
+    if se["status"] == "已关账":
+        assert se["timeout_flag"] == 1
+    else:
+        assert se["timeout_flag"] == 0
+    acts = _events(sid)
+    assert acts.count("结算关账") + acts.count("异常中断") == 1  # 不得双终态
+    assert raw_pile(sid) == {"pile_status": "空闲", "gun_status": "可用"}
+
+
+def test_fake_surface_residue_purged_and_torn_row_reconciled(fresh):
+    """假超时层残迹：旁路假键须被迁移清除；回执在而终态被回退的撕裂行须补齐。"""
+    sid = open_and_pulse(fresh, pile_id=1, kwh=6.0)
+    age_session(sid, 300)
+    assert fresh.post(f"/api/会话/{sid}/超时").status_code == 200
+    # 模拟假层残迹：终态字被回退成在充（回执仍在）+ 旁路假灯/假计数键。
+    with db() as conn:
+        conn.execute("UPDATE sessions SET status='充电中' WHERE id=?", (sid,))
+        conn.execute(
+            "INSERT OR REPLACE INTO settings(key,value) VALUES('surface_last','{\"ok\":true,\"已超时\":1,\"充电中\":0}')"
+        )
+        conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('surface_ok','1')")
+        conn.execute(
+            "INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",
+            (f"timeout_surface:{sid}", '{"ok":true,"timed_out":true}'),
+        )
+
+    from app.db import init_db
+
+    init_db()  # 启动迁移：旁路假键清零
+    with db() as conn:
+        n = conn.execute(
+            "SELECT COUNT(*) AS n FROM settings WHERE key LIKE 'surface_%' OR key LIKE 'timeout_surface:%'"
+        ).fetchone()["n"]
+        assert n == 0
+        fixed = svc.reconcile_legacy_timeouts(conn)
+    assert fixed == 1
+
+    se = raw_session(sid)
+    assert se["status"] == "已关账" and se["timeout_flag"] == 1
+    # 金额对齐回执（回执是金额唯一事实源），可重放。
+    r = fresh.get(f"/api/会话/{sid}/超时/重放").json()
+    assert r["金额一致"] is True and r["占用已清"] is True
+    assert raw_pile(sid) == {"pile_status": "空闲", "gun_status": "可用"}
+    o = fresh.get("/api/总览").json()
+    assert o["已超时"] == 1 and o["超时占用残留"] == 0
+    assert "surface_ok" not in o

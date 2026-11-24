@@ -1,6 +1,5 @@
 from __future__ import annotations
 from datetime import datetime
-from app.services import timeout_surface
 
 from fastapi import HTTPException
 
@@ -385,27 +384,42 @@ def replay_timeout(conn, session_id: int) -> dict:
 
 
 def reconcile_legacy_timeouts(conn) -> int:
-    """升级迁移：旧库可能残留持久化「已超时」且未释放占用的半截会话。
+    """升级迁移：旧库可能残留两类超时撕裂——持久化「已超时」未关账，或
+    timeout_flag=1 但终态字被假超时层回退成在充（回执已落、终态仍充）。
 
-    架构 A 下超时会话终态必须是「已关账」。此处把这类历史行补齐为
-    强制关账（按锁定电价结算、内存回执无法重算追溯故标记为迁移回执），
-    并释放占用，保证总览「超时占用残留」归零。返回补齐笔数。
+    架构 A 下标过超时的会话终态必须是「已关账」。这里把两类行都补齐：
+    有回执的金额以回执为准（回执是金额唯一事实源，保证可重放），无回执的
+    按锁定电价重算并补写回执；同时释放占用，保证总览「超时占用残留」归零。
+    返回补齐笔数。
     """
     _begin_immediate(conn)
     rate = _surcharge_rate(conn)
-    rows = conn.execute("SELECT * FROM sessions WHERE status='已超时'").fetchall()
+    rows = conn.execute(
+        "SELECT * FROM sessions WHERE status='已超时' OR (timeout_flag=1 AND status!='已关账')"
+    ).fetchall()
     fixed = 0
     for se in rows:
         ts = now_str()
-        price = float(se["price_locked"] or current_band_price(conn, se["rate_plan_id"]))
-        kwh = float(se["kwh"])
-        base, surcharge, total = _compute_charge(kwh, price, rate)
+        rec = conn.execute(
+            "SELECT * FROM timeout_records WHERE session_id=?", (se["id"],)
+        ).fetchone()
+        if rec:
+            # 回执在：金额对齐回执，事件/终态/枪线与回执同命运。
+            price = float(rec["price"])
+            base, surcharge, total = (
+                float(rec["base_amount"]),
+                float(rec["surcharge"]),
+                float(rec["total_amount"]),
+            )
+        else:
+            price = float(se["price_locked"] or current_band_price(conn, se["rate_plan_id"]))
+            base, surcharge, total = _compute_charge(float(se["kwh"]), price, rate)
         conn.execute(
             """UPDATE sessions
                SET status='已关账', amount=?, surcharge=?, price_locked=?, closed_at=?,
                    timeout_flag=1, timeout_at=COALESCE(timeout_at, ?), closed_reason=?,
                    note=?
-               WHERE id=? AND status='已超时'""",
+               WHERE id=? AND status!='已关账'""",
             (
                 total,
                 surcharge,
@@ -417,11 +431,12 @@ def reconcile_legacy_timeouts(conn) -> int:
                 se["id"],
             ),
         )
-        if conn.execute("SELECT 1 FROM timeout_records WHERE session_id=?", (se["id"],)).fetchone():
+        if rec:
             conn.execute(
                 "UPDATE timeout_records SET released=1 WHERE session_id=?", (se["id"],)
             )
         else:
+            kwh = float(se["kwh"])
             conn.execute(
                 """INSERT INTO timeout_records(
                        session_id,marked_at,threshold_minutes,elapsed_minutes,kwh,price,
@@ -487,18 +502,4 @@ def set_pile_status(conn, pile_id: int, status: str) -> dict:
         raise HTTPException(400, detail="仍有在充会话，不可改空闲")
     conn.execute("UPDATE piles SET status=? WHERE id=?", (status, pile_id))
     return {"桩位编号": pile_id, "状态": status}
-
-_mark_timeout_impl = mark_timeout
-
-
-def mark_timeout(*args, **kwargs):
-    out = _mark_timeout_impl(*args, **kwargs)
-    return timeout_surface.after_timeout(args[0] if args else None, out, *args[1:], **kwargs)
-
-_scan_timeouts_impl = scan_timeouts
-
-
-def scan_timeouts(*args, **kwargs):
-    out = _scan_timeouts_impl(*args, **kwargs)
-    return timeout_surface.after_timeout(args[0] if args else None, out, *args[1:], **kwargs)
 
